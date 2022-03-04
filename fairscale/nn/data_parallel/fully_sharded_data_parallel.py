@@ -1408,6 +1408,18 @@ class FullyShardedDataParallel(nn.Module):
             ), f"{param._saved_grad_shard.shape} vs {param.grad.shape}"
             param.grad.data += param._saved_grad_shard
             delattr(param, "_saved_grad_shard")
+
+        if param._is_sharded:
+            # Accumulate into the gradient shard.
+            if getattr(param, "_saved_grad_shard", None) is None:
+                param._saved_grad_shard = reduced_grad.data
+            else:
+                assert (
+                    param._saved_grad_shard.shape == reduced_grad.shape
+                ), f"{param._saved_grad_shard.shape} vs {reduced_grad.shape}"
+                param._saved_grad_shard.data += reduced_grad.data
+            reduced_grad = param._saved_grad_shard.data
+
         # Optionally move gradients to CPU, typically used if one is running
         # the optimizer on the CPU.
         if self.move_grads_to_cpu:
@@ -1460,11 +1472,17 @@ class FullyShardedDataParallel(nn.Module):
         def _remove_shard_bwd_hook(fsdp_module: FullyShardedDataParallel) -> None:
             """Helper used below on all fsdp modules."""
             for p in fsdp_module.params:
-                if p.requires_grad:
-                    if hasattr(p, "_shard_bwd_hook"):
-                        assert len(p._shard_bwd_hook) == 2, len(p._shard_bwd_hook)
-                        p._shard_bwd_hook[1].remove()
-                        delattr(p, "_shard_bwd_hook")
+                if not p.requires_grad:
+                    continue
+                if hasattr(p, "_shard_bwd_hook"):
+                    assert len(p._shard_bwd_hook) == 2, len(p._shard_bwd_hook)
+                    p._shard_bwd_hook[1].remove()
+                    delattr(p, "_shard_bwd_hook")
+                # Parameter and gradient devices must match.
+                if hasattr(p, "_saved_grad_shard"):
+                    assert p.device == p._saved_grad_shard.device
+                    p.grad = p._saved_grad_shard
+
 
         # Update root and nested FSDP's hooks and flags.
         for m in self.modules():  # includes self
